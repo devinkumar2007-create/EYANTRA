@@ -1,11 +1,10 @@
 #!/usr/bin/env python3
 """
-Boilerplate controller for the HE bot.
-
-Fetches a shape from the get_shape service and builds a list of waypoints
-to trace it. Fill in the control loop to drive the robot through them.
-
-
+Task 1C – PID Shape Controller
+================================
+Calls /get_shape once at startup, builds waypoints for the assigned shape,
+then drives the HE bot through them with a PID controller whose output is
+converted to wheel speeds via the Task-1B inverse kinematics.
 """
 
 import argparse
@@ -18,38 +17,67 @@ from nav_msgs.msg import Odometry
 from std_msgs.msg import Float64MultiArray
 from shape_interface.srv import GetShape
 
-# Wheel <-> body-velocity mapping, columns are [left, right, back] wheel
-# speed (rad/s); rows are body frame [vx, vy, wz] per unit wheel speed.
-_WHEEL_TO_BODY = np.array([
-    [0.0, 0.0, 0.0],  # vx per unit [left, right, back] wheel speed
-    [0.0, 0.0, 0.0],  # vy per unit [left, right, back] wheel speed
-    [0.0, 0.0, 0.0],  # wz per unit [left, right, back] wheel speed
-])
-_BODY_TO_WHEEL = np.linalg.inv(_WHEEL_TO_BODY)
-_CTRL_LIMIT = 0.0      # rad/s, matches lekiwi.xml actuator ctrlrange
+# ---------------------------------------------------------------------------
+# Robot physical constants (from Task 1B – proven values)
+# ---------------------------------------------------------------------------
+WHEEL_RADIUS_M   = 0.0255
+CHASSIS_RADIUS_M = 0.06412
+WHEEL_ANGLES_RAD = np.radians([30.0, 150.0, 270.0])   # [left, right, back]
 
-WAYPOINT_TOLERANCE = 0.0   # metres
-CIRCLE_SEGMENTS     = 36
-POSITION_KP         = 0.0
-YAW_HOLD_KP         = 0.0
-CONTROL_PERIOD      = 0.0  
+_CTRL_LIMIT = 20.0   # rad/s  wheel speed cap
 
+# ---------------------------------------------------------------------------
+# Control tuning constants
+# ---------------------------------------------------------------------------
+WAYPOINT_TOLERANCE  = 0.12   # metres – wider = less overshoot jitter at corners
+CIRCLE_SEGMENTS     = 72     # straight-line segments that approximate a circle
+CONTROL_PERIOD      = 0.05   # seconds  (20 Hz)
+
+# Position PID  (ex and ey treated identically)
+# KD kept very small – derivative of noisy odometry is the main source of shaking
+POS_KP             = 0.8
+POS_KI             = 0.005
+POS_KD             = 0.04
+POS_MAX_SPEED      = 0.25    # m/s cap on PID output (lower = smoother)
+POS_INTEGRAL_CLAMP = 0.30    # anti-windup
+
+# Yaw-hold PID  (robot keeps its initial heading throughout)
+YAW_KP       = 1.2
+YAW_KI       = 0.01
+YAW_KD       = 0.03
+YAW_MAX_RATE = 0.8           # rad/s cap
+YAW_DEAD_ZONE = math.radians(3.0)   # ignore yaw errors smaller than 3 deg
+
+
+# ---------------------------------------------------------------------------
+# body_to_wheels  –  Task-1B inverse kinematics, reused verbatim
+# ---------------------------------------------------------------------------
 def body_to_wheels(vx, vy, wz):
     """Body-frame (vx, vy, wz) -> wheel angular velocities [left, right, back]."""
-    # TODO: convert body velocity to wheel speeds using _BODY_TO_WHEEL,
-    # clip each wheel to [-_CTRL_LIMIT, _CTRL_LIMIT], return as a list.
-    pass
+    wheel_speeds = (
+        vx * np.cos(WHEEL_ANGLES_RAD)
+        + vy * np.sin(WHEEL_ANGLES_RAD)
+        + CHASSIS_RADIUS_M * wz
+    ) / WHEEL_RADIUS_M
+    wheel_speeds = np.clip(wheel_speeds, -_CTRL_LIMIT, _CTRL_LIMIT)
+    return wheel_speeds.tolist()
 
 
+# ---------------------------------------------------------------------------
+# yaw_from_quat
+# ---------------------------------------------------------------------------
 def yaw_from_quat(w, x, y, z):
-    # TODO: convert quaternion to yaw (radians).
-    pass
+    """Extract yaw (rotation about world Z) from a unit quaternion."""
+    return math.atan2(2.0 * (w * z + x * y),
+                      1.0 - 2.0 * (y * y + z * z))
 
 
+# ---------------------------------------------------------------------------
+# Waypoint helpers  (unchanged from boilerplate)
+# ---------------------------------------------------------------------------
 def _regular_polygon(cx, cy, n_sides, side_length, start_angle=math.pi / 2):
     """Vertices of a regular polygon centred on (cx, cy), closed back to the
-    first vertex so the last waypoint returns the robot to where it started
-    drawing."""
+    first vertex so the last waypoint returns the robot to where it started."""
     r = side_length / (2 * math.sin(math.pi / n_sides))
     pts = [
         (cx + r * math.cos(start_angle + 2 * math.pi * i / n_sides),
@@ -60,9 +88,9 @@ def _regular_polygon(cx, cy, n_sides, side_length, start_angle=math.pi / 2):
 
 
 def build_waypoints(shape_name, data):
-    """World-frame waypoints for `shape_name`, as returned by the get_shape
-    service: data[0:2] is the shape's centre (x, y); the remaining entries
-    are its size parameters (see shape_service.cpp's shape_map)."""
+    """World-frame waypoints for shape_name, as returned by the get_shape
+    service: data[0:2] is the shape centre (x, y); remaining entries are
+    size parameters."""
     cx, cy = data[0], data[1]
 
     if shape_name == "Circle":
@@ -72,16 +100,12 @@ def build_waypoints(shape_name, data):
              cy + radius * math.sin(2 * math.pi * i / CIRCLE_SEGMENTS))
             for i in range(1, CIRCLE_SEGMENTS + 1)
         ]
-
     if shape_name == "Square":
         return _regular_polygon(cx, cy, 4, data[2], start_angle=math.pi / 4)
-
     if shape_name == "Triangle":
         return _regular_polygon(cx, cy, 3, data[2])
-
     if shape_name == "Pentagon":
         return _regular_polygon(cx, cy, 5, data[2])
-
     if shape_name == "Rectangle":
         w, h = data[2], data[3]
         corners = [
@@ -95,55 +119,187 @@ def build_waypoints(shape_name, data):
     raise ValueError(f"unknown shape '{shape_name}'")
 
 
+# ---------------------------------------------------------------------------
+# ShapeController  –  main ROS 2 node
+# ---------------------------------------------------------------------------
 class ShapeController(Node):
     def __init__(self, speed):
         super().__init__("shape_controller")
-        self.speed = speed
+        self.speed = speed          # user-supplied max approach speed
 
-        self.pose = None        # (x, y, yaw), latest ground truth
-        self.start_pose = None  # (x, y, yaw), recorded on first odom message
-        self.wp_index = 0
-        self.done = False
-#Add the publsiher and subscriber scripts
-    
+        self.pose       = None      # (x, y, yaw) – latest /odom reading
+        self.start_pose = None      # (x, y, yaw) – recorded on first callback
+        self.wp_index   = 0
+        self.done       = False
+
+        # PID state variables
+        self._prev_err_x  = 0.0
+        self._prev_err_y  = 0.0
+        self._prev_err_th = 0.0
+        self._int_x       = 0.0
+        self._int_y       = 0.0
+        self._int_th      = 0.0
+        self._last_time   = None
+
+        # Publisher – wheel angular velocities
+        self.cmd_pub = self.create_publisher(
+            Float64MultiArray, "/wheel_commands", 10)
+
+        # Subscriber – odometry feedback
+        self.create_subscription(Odometry, "/odom", self._odom_cb, 10)
+
+        # Service call – find out which shape to trace
+        self.get_logger().info("Requesting shape from /get_shape …")
+        shape_name, waypoints = self._request_shape()
+        self.waypoints = waypoints
+        self.get_logger().info(
+            f"Shape assigned: {shape_name}  ({len(waypoints)} waypoints)")
+
+        # 20 Hz control timer
+        self.timer = self.create_timer(CONTROL_PERIOD, self._control_step)
+
+    # ------------------------------------------------------------------ #
+    # /get_shape service client
+    # ------------------------------------------------------------------ #
     def _request_shape(self):
         client = self.create_client(GetShape, "get_shape")
         while not client.wait_for_service(timeout_sec=2.0):
-            self.get_logger().info("Waiting for get_shape service...")
+            self.get_logger().info("Waiting for get_shape service …")
 
         future = client.call_async(GetShape.Request())
         rclpy.spin_until_future_complete(self, future)
         response = future.result()
         if response is None or not response.success:
             raise RuntimeError(
-                f"get_shape service call failed: {response and response.message}"
-            )
+                f"get_shape failed: {response and response.message}")
 
-        return response.shape_name, build_waypoints(response.shape_name, list(response.data))
+        return response.shape_name, build_waypoints(
+            response.shape_name, list(response.data))
 
+    # ------------------------------------------------------------------ #
+    # Odometry callback
+    # ------------------------------------------------------------------ #
     def _odom_cb(self, msg):
-        # TODO: extract (x, y, yaw) from msg.pose.pose into self.pose,
-        # and record self.start_pose on the first callback.
-        pass
+        q   = msg.pose.pose.orientation
+        x   = msg.pose.pose.position.x
+        y   = msg.pose.pose.position.y
+        yaw = yaw_from_quat(q.w, q.x, q.y, q.z)
+        self.pose = (x, y, yaw)
 
+        if self.start_pose is None:
+            self.start_pose = (x, y, yaw)
+            self.get_logger().info(
+                f"Start pose recorded: "
+                f"x={x:.3f}  y={y:.3f}  yaw={math.degrees(yaw):.1f} deg")
+
+    # ------------------------------------------------------------------ #
     def _publish(self, wheels):
         self.cmd_pub.publish(Float64MultiArray(data=wheels))
 
+    # ------------------------------------------------------------------ #
+    # PID control step  (called at 20 Hz by self.timer)
+    # ------------------------------------------------------------------ #
     def _control_step(self):
-        if self.done or self.pose is None:
+        if self.done or self.pose is None or self.start_pose is None:
             return
 
-        # TODO: drive toward self.waypoints[self.wp_index], advance
-        # wp_index on arrival (within WAYPOINT_TOLERANCE), set self.done
-        # and stop when all waypoints are reached, then call
-        # self._publish(body_to_wheels(vx, vy, wz)) each step.
-        pass
+        # Measure actual dt (fall back to nominal on first call)
+        now = self.get_clock().now().nanoseconds * 1e-9
+        dt  = CONTROL_PERIOD
+        if self._last_time is not None:
+            dt = max(now - self._last_time, 1e-4)
+        self._last_time = now
+
+        rx, ry, ryaw = self.pose
+
+        # ---- Shape completion check ------------------------------------
+        if self.wp_index >= len(self.waypoints):
+            if not self.done:
+                self.done = True
+                self._publish([0.0, 0.0, 0.0])
+                self.get_logger().info(
+                    "Shape completed! All waypoints reached – robot stopped.")
+            return
+
+        tx, ty = self.waypoints[self.wp_index]
+
+        # World-frame position errors
+        ex_w = tx - rx
+        ey_w = ty - ry
+        dist = math.sqrt(ex_w**2 + ey_w**2)
+
+        # ---- Advance to next waypoint on arrival -----------------------
+        if dist < WAYPOINT_TOLERANCE:
+            self.wp_index += 1
+            self.get_logger().info(
+                f"  Waypoint {self.wp_index}/{len(self.waypoints)} "
+                f"reached (dist={dist:.3f} m)")
+            # Reset integrators to avoid carry-over between waypoints
+            self._int_x = self._int_y = self._int_th = 0.0
+            self._prev_err_x = self._prev_err_y = self._prev_err_th = 0.0
+            self._publish([0.0, 0.0, 0.0])
+            return
+
+        # ---- Position PID in world frame -------------------------------
+        self._int_x = float(np.clip(
+            self._int_x + ex_w * dt,
+            -POS_INTEGRAL_CLAMP, POS_INTEGRAL_CLAMP))
+        self._int_y = float(np.clip(
+            self._int_y + ey_w * dt,
+            -POS_INTEGRAL_CLAMP, POS_INTEGRAL_CLAMP))
+
+        d_ex = (ex_w - self._prev_err_x) / dt
+        d_ey = (ey_w - self._prev_err_y) / dt
+        self._prev_err_x = ex_w
+        self._prev_err_y = ey_w
+
+        vx_w = POS_KP * ex_w + POS_KI * self._int_x + POS_KD * d_ex
+        vy_w = POS_KP * ey_w + POS_KI * self._int_y + POS_KD * d_ey
+
+        # Clamp world-frame speed
+        max_spd = min(self.speed, POS_MAX_SPEED)
+        spd = math.sqrt(vx_w**2 + vy_w**2)
+        if spd > max_spd:
+            scale = max_spd / spd
+            vx_w *= scale
+            vy_w *= scale
+
+        # ---- Rotate world-frame velocity into robot body frame ----------
+        cos_y = math.cos(ryaw)
+        sin_y = math.sin(ryaw)
+        vx_b =  vx_w * cos_y + vy_w * sin_y
+        vy_b = -vx_w * sin_y + vy_w * cos_y
+
+        # ---- Yaw-hold PID (maintain initial heading throughout) --------
+        err_th = math.atan2(
+            math.sin(self.start_pose[2] - ryaw),
+            math.cos(self.start_pose[2] - ryaw))
+
+        # Dead-zone: ignore tiny yaw errors to prevent constant micro-corrections
+        if abs(err_th) < YAW_DEAD_ZONE:
+            err_th = 0.0
+
+        self._int_th = float(np.clip(
+            self._int_th + err_th * dt,
+            -POS_INTEGRAL_CLAMP, POS_INTEGRAL_CLAMP))
+        d_eth = (err_th - self._prev_err_th) / dt
+        self._prev_err_th = err_th
+
+        wz = float(np.clip(
+            YAW_KP * err_th + YAW_KI * self._int_th + YAW_KD * d_eth,
+            -YAW_MAX_RATE, YAW_MAX_RATE))
+
+        # ---- Task-1B IK -> wheel commands ------------------------------
+        self._publish(body_to_wheels(vx_b, vy_b, wz))
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--speed", type=float, default=0.25,
-                         help="max approach speed, m/s")
+                        help="max approach speed m/s (default 0.25)")
     args, ros_args = parser.parse_known_args()
 
     rclpy.init(args=ros_args)
