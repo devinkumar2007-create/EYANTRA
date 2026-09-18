@@ -18,6 +18,12 @@ install(PROGRAMS
 )
 
 install(PROGRAMS
+  task_1b/go_to_yellow.py
+  DESTINATION lib/${PROJECT_NAME}
+  RENAME go_to_yellow
+)
+
+install(PROGRAMS
   bin/cmd_vel_publisher
   DESTINATION lib/${PROJECT_NAME}
 )

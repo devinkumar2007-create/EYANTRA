@@ -1,3 +1,4 @@
+#!/usr/bin/env python3
 # Copyright (c) 2026 e-Yantra, IIT Bombay. All rights reserved.
 # These simulation files and source code are the intellectual property of e-Yantra,
 # IIT Bombay, provided solely for eYRC 2026-27 (Theme: Hola The Explorer).
@@ -64,33 +65,20 @@ def body_velocity_to_wheel_speeds(vx, vy, w):
     Args:
         vx: forward/backward velocity of the chassis, in m/s.
         vy: sideways velocity of the chassis, in m/s.
-        w:  yaw rate of the chassis, in rad/s (positive = CCW).
+        w: yaw rate of the chassis, in rad/s (positive = CCW).
 
     Returns:
         A sequence of exactly 3 numbers -- the angular speed each wheel
-        needs to spin at, in rad/s -- ordered [left, right, back] to match
-        /wheel_commands.
-
-    TODO: derive and implement the inverse kinematics matrix for this
-    robot's 3-wheel omni (kiwi) drive. For each wheel i, driving along
-    WHEEL_ANGLES_RAD[i] and sitting CHASSIS_RADIUS_M from the centre:
-
-      1. Each wheel's axle points radially outward, perpendicular to the
-         direction it drives in; the wheel can only drive (no slip) along
-         WHEEL_ANGLES_RAD[i] -- the passive rollers absorb any motion
-         along the axle itself.
-      2. Write the chassis velocity at that wheel's position as a function
-         of (vx, vy, w).
-      3. Project that velocity onto the wheel's driven direction, and
-         relate it to the wheel's angular speed through WHEEL_RADIUS_M.
-
-    That gives one equation per wheel; stack the three into a matrix and
-    you have your inverse kinematics.
+        needs to spin at, in rad/s -- ordered [left, right, back].
     """
-    # ----- YOUR CODE HERE -----------------------------------------------
-    raise NotImplementedError("TODO: implement body_velocity_to_wheel_speeds")
-    # ----------------------------------------------------------------------
 
+    wheel_speeds = (
+        vx * np.cos(WHEEL_ANGLES_RAD)
+        + vy * np.sin(WHEEL_ANGLES_RAD)
+        + CHASSIS_RADIUS_M * w
+    ) / WHEEL_RADIUS_M
+
+    return wheel_speeds.tolist()
 
 class InverseKinematicsNode(Node):
 
@@ -109,15 +97,3 @@ class InverseKinematicsNode(Node):
 
 def main():
     rclpy.init()
-    node = InverseKinematicsNode()
-    try:
-        rclpy.spin(node)
-    except KeyboardInterrupt:
-        pass
-    finally:
-        node.destroy_node()
-        rclpy.shutdown()
-
-
-if __name__ == "__main__":
-    main()
