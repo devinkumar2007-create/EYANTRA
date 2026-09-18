@@ -1,0 +1,7 @@
+__pycache__/
+*.pyc
+*.pyo
+Software/workspace/build/
+Software/workspace/install/
+Software/workspace/log/
+Software/workspace/__pycache__/
